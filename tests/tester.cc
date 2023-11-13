@@ -16,10 +16,10 @@
 #include <sstream>
 #include <fstream>
 
-static JsonDocument JsonConstruct(const char* str)
+static tinygltf::detail::JsonDocument JsonConstruct(const char* str)
 {
-  JsonDocument doc;
-  JsonParse(doc, str, strlen(str));
+  tinygltf::detail::JsonDocument doc;
+  tinygltf::detail::JsonParse(doc, str, strlen(str));
   return doc;
 }
 
@@ -275,9 +275,9 @@ TEST_CASE("parse-integer", "[bounds-checking]") {
 
     err.clear();
     {
-      JsonDocument o;
+      tinygltf::detail::JsonDocument o;
       double nan = std::numeric_limits<double>::quiet_NaN();
-      tinygltf::JsonAddMember(o, "int", json(nan));
+      tinygltf::detail::JsonAddMember(o, "int", tinygltf::detail::json(nan));
       CHECK_FALSE(tinygltf::ParseIntegerProperty(
         &result, &err, o,
         "int", true));
@@ -321,9 +321,9 @@ TEST_CASE("parse-unsigned", "[bounds-checking]") {
 
     err.clear();
     {
-      JsonDocument o;
+      tinygltf::detail::JsonDocument o;
       double nan = std::numeric_limits<double>::quiet_NaN();
-      tinygltf::JsonAddMember(o, "int", json(nan));
+      tinygltf::detail::JsonAddMember(o, "int", tinygltf::detail::json(nan));
       CHECK_FALSE(tinygltf::ParseUnsignedProperty(
         &result, &err, o,
         "int", true));
@@ -392,27 +392,105 @@ TEST_CASE("pbr-khr-texture-transform", "[material]") {
 
 TEST_CASE("image-uri-spaces", "[issue-236]") {
 
-  tinygltf::Model model;
   tinygltf::TinyGLTF ctx;
   std::string err;
   std::string warn;
 
   // Test image file with single spaces.
-  bool ret = ctx.LoadASCIIFromFile(&model, &err, &warn, "../models/CubeImageUriSpaces/CubeImageUriSpaces.gltf");
-  if (!err.empty()) {
-    std::cerr << err << std::endl;
-  }
+  {
+    tinygltf::Model model;
+    bool ret = ctx.LoadASCIIFromFile(
+        &model, &err, &warn,
+        "../models/CubeImageUriSpaces/CubeImageUriSpaces.gltf");
+    if (!warn.empty()) {
+      std::cerr << warn << std::endl;
+    }
+    if (!err.empty()) {
+      std::cerr << err << std::endl;
+    }
 
-  REQUIRE(true == ret);
+    REQUIRE(true == ret);
+    REQUIRE(warn.empty());
+    REQUIRE(err.empty());
+    REQUIRE(model.images.size() == 1);
+    REQUIRE(model.images[0].uri.find(' ') != std::string::npos);
+  }
 
   // Test image file with a beginning space, trailing space, and greater than
   // one consecutive spaces.
-  ret = ctx.LoadASCIIFromFile(&model, &err, &warn, "../models/CubeImageUriSpaces/CubeImageUriMultipleSpaces.gltf");
+  tinygltf::Model model;
+  bool ret = ctx.LoadASCIIFromFile(
+      &model, &err, &warn,
+      "../models/CubeImageUriSpaces/CubeImageUriMultipleSpaces.gltf");
+  if (!warn.empty()) {
+    std::cerr << warn << std::endl;
+  }
   if (!err.empty()) {
     std::cerr << err << std::endl;
   }
 
   REQUIRE(true == ret);
+  REQUIRE(warn.empty());
+  REQUIRE(err.empty());
+  REQUIRE(model.images.size() == 1);
+  REQUIRE(model.images[0].uri.size() > 1);
+  REQUIRE(model.images[0].uri[0] == ' ');
+
+  // Test the URI encoding API by saving and re-load the file, without embedding
+  // the image.
+  // TODO(syoyo): create temp directory.
+  {
+    // Encoder that only replaces spaces with "%20".
+    auto uriencode = [](const std::string &in_uri,
+                        const std::string &object_type, std::string *out_uri,
+                        void *user_data) -> bool {
+      (void)user_data;
+      bool imageOrBuffer = object_type == "image" || object_type == "buffer";
+      REQUIRE(true == imageOrBuffer);
+      *out_uri = {};
+      for (char c : in_uri) {
+        if (c == ' ')
+          *out_uri += "%20";
+        else
+          *out_uri += c;
+      }
+      return true;
+    };
+
+    // Remove the buffer URI, so a new one is generated based on the gltf
+    // filename and then encoded with the above callback.
+    model.buffers[0].uri.clear();
+
+    tinygltf::URICallbacks uri_cb{uriencode, tinygltf::URIDecode, nullptr};
+    ctx.SetURICallbacks(uri_cb);
+    ret = ctx.WriteGltfSceneToFile(&model, " issue-236.gltf", false, false);
+    REQUIRE(true == ret);
+
+    // read back serialized glTF
+    tinygltf::Model saved;
+    bool ret = ctx.LoadASCIIFromFile(&saved, &err, &warn, " issue-236.gltf");
+    if (!err.empty()) {
+      std::cerr << err << std::endl;
+    }
+    REQUIRE(true == ret);
+    REQUIRE(err.empty());
+    REQUIRE(!warn.empty());  // relative image path won't exist in tests/
+    REQUIRE(saved.images.size() == model.images.size());
+
+    // The image uri in CubeImageUriMultipleSpaces.gltf is not encoded and
+    // should be different after encoding spaces with %20.
+    REQUIRE(model.images[0].uri != saved.images[0].uri);
+
+    // Verify the image path remains the same after uri decoding
+    std::string image_uri, image_uri_saved;
+    (void)tinygltf::URIDecode(model.images[0].uri, &image_uri, nullptr);
+    (void)tinygltf::URIDecode(saved.images[0].uri, &image_uri_saved, nullptr);
+    REQUIRE(image_uri == image_uri_saved);
+
+    // Verify the buffer's generated and encoded URI
+    REQUIRE(saved.buffers.size() == model.buffers.size());
+    REQUIRE(saved.buffers[0].uri == "%20issue-236.bin");
+  }
 }
 
 TEST_CASE("serialize-empty-material", "[issue-294]") {
@@ -426,7 +504,8 @@ TEST_CASE("serialize-empty-material", "[issue-294]") {
   std::stringstream os;
 
   tinygltf::TinyGLTF ctx;
-  ctx.WriteGltfSceneToStream(&m, os, false, false);
+  bool ret = ctx.WriteGltfSceneToStream(&m, os, false, false);
+  REQUIRE(true == ret);
 
   // use nlohmann json
   nlohmann::json j = nlohmann::json::parse(os.str());
@@ -454,7 +533,8 @@ TEST_CASE("empty-skeleton-id", "[issue-321]") {
 
   std::stringstream os;
 
-  ctx.WriteGltfSceneToStream(&model, os, false, false);
+  ret = ctx.WriteGltfSceneToStream(&model, os, false, false);
+  REQUIRE(true == ret);
 
   // use nlohmann json
   nlohmann::json j = nlohmann::json::parse(os.str());
@@ -556,8 +636,9 @@ TEST_CASE("serialize-const-image", "[issue-394]") {
   std::stringstream os;
 
   tinygltf::TinyGLTF ctx;
-  ctx.WriteGltfSceneToStream(const_cast<const tinygltf::Model *>(&m), os, false,
+  bool ret = ctx.WriteGltfSceneToStream(const_cast<const tinygltf::Model *>(&m), os, false,
                              false);
+  REQUIRE(true == ret);
   REQUIRE(m.images[0].uri == i.uri);
 
   // use nlohmann json
@@ -583,7 +664,11 @@ TEST_CASE("serialize-image-callback", "[issue-394]") {
 
   auto writer = [](const std::string *basepath, const std::string *filename,
                    const tinygltf::Image *image, bool embedImages,
-                   std::string *out_uri, void *user_pointer) -> bool {
+                   const tinygltf::URICallbacks *uri_cb, std::string *out_uri,
+                   void *user_pointer) -> bool {
+    (void)basepath;
+    (void)image;
+    (void)uri_cb;
     REQUIRE(*filename == "foo");
     REQUIRE(embedImages == true);
     REQUIRE(user_pointer == (void *)0xba5e1e55);
@@ -616,7 +701,15 @@ TEST_CASE("serialize-image-failure", "[issue-394]") {
 
   auto writer = [](const std::string *basepath, const std::string *filename,
                    const tinygltf::Image *image, bool embedImages,
-                   std::string *out_uri, void *user_pointer) -> bool {
+                   const tinygltf::URICallbacks *uri_cb, std::string *out_uri,
+                   void *user_pointer) -> bool {
+    (void)basepath;
+    (void)filename;
+    (void)image;
+    (void)embedImages;
+    (void)uri_cb;
+    (void)out_uri;
+    (void)user_pointer;
     return false;
   };
 
@@ -627,4 +720,40 @@ TEST_CASE("serialize-image-failure", "[issue-394]") {
 
   REQUIRE(false == result);
   REQUIRE(os.str().size() == 0);
+}
+
+TEST_CASE("filesize-check", "[issue-416]") {
+
+  tinygltf::Model model;
+  tinygltf::TinyGLTF ctx;
+  std::string err;
+  std::string warn;
+
+  ctx.SetMaxExternalFileSize(10); // 10 bytes. will fail to load texture image.
+
+  bool ret = ctx.LoadASCIIFromFile(&model, &err, &warn, "../models/Cube/Cube.gltf");
+  if (!err.empty()) {
+    std::cerr << err << std::endl;
+  }
+
+  REQUIRE(false == ret);
+}
+
+TEST_CASE("load-issue-416-model", "[issue-416]") {
+
+  tinygltf::Model model;
+  tinygltf::TinyGLTF ctx;
+  std::string err;
+  std::string warn;
+
+  bool ret = ctx.LoadASCIIFromFile(&model, &err, &warn, "issue-416.gltf");
+  if (!warn.empty()) {
+    std::cout << "WARN:" << warn << std::endl;
+  }
+  if (!err.empty()) {
+    std::cerr << "ERR:" << err << std::endl;
+  }
+
+  // external file load fails, but reading glTF itself is ok.
+  REQUIRE(true == ret);
 }
